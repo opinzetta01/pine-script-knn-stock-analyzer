@@ -1,0 +1,131 @@
+//@version=6
+indicator('ML kNN Strategy V6 - Inversor Pro Full', 'ML-kNN v6 Final', true, max_labels_count=500)
+
+// --------------------------------------------------------------------------------
+// Inputs de Configuración
+// --------------------------------------------------------------------------------
+grp_ml    = "Configuración Machine Learning"
+i_indicator = input.string('All', 'Indicador Base', ['RSI','ROC','CCI','Volume','All'], group=grp_ml)
+i_shortWin  = input.int(14, 'Periodo Corto', 1, group=grp_ml)
+i_longWin   = input.int(28, 'Periodo Largo', 2, group=grp_ml)
+i_baseK     = input.int(252, 'Vecinos Base (K)', 5, group=grp_ml)
+
+grp_filt  = "Filtros de Tendencia y Volatilidad"
+i_useEma    = input.bool(true, 'Usar Filtro EMA Tendencia', group=grp_filt)
+i_emaLen    = input.int(200, 'Periodo EMA', options=[21, 30, 50, 100, 150, 200], group=grp_filt)
+i_filterVol = input.bool(true, 'Filtro Volatilidad ATR', group=grp_filt)
+
+grp_risk  = "Gestión de Riesgo (Trailing Stop)"
+i_atrLen    = input.int(14, 'Periodo ATR para Stop', 1, group=grp_risk)
+i_atrMult   = input.float(2.5, 'Multiplicador ATR', 0.5, 5.0, 0.1, group=grp_risk)
+
+// --------------------------------------------------------------------------------
+// ML Logic & Engine
+// --------------------------------------------------------------------------------
+int k = math.floor(math.sqrt(i_baseK))
+minimax(float x, int p) =>
+    float hi = ta.highest(x, p), float lo = ta.lowest(x, p)
+    (x - lo) / (hi - lo + 1e-10) 
+
+float f1 = switch i_indicator
+    'RSI'    => ta.rsi(close, i_longWin)
+    'CCI'    => ta.cci(close, i_longWin)
+    'ROC'    => ta.roc(close, i_longWin)
+    'Volume' => minimax(volume, i_longWin)
+    => math.avg(ta.rsi(close, i_longWin), ta.cci(close, i_longWin), ta.roc(close, i_longWin), minimax(volume, i_longWin))
+
+float f2 = switch i_indicator
+    'RSI'    => ta.rsi(close, i_shortWin)
+    'CCI'    => ta.cci(close, i_shortWin)
+    'ROC'    => ta.roc(close, i_shortWin)
+    'Volume' => minimax(volume, i_shortWin)
+    => math.avg(ta.rsi(close, i_shortWin), ta.cci(close, i_shortWin), ta.roc(close, i_shortWin), minimax(volume, i_shortWin))
+
+var array<float> a_f1 = array.new_float(0), var array<float> a_f2 = array.new_float(0), var array<int> a_dir = array.new_int(0)
+if not barstate.isrealtime
+    array.push(a_f1, f1), array.push(a_f2, f2), array.push(a_dir, int(math.sign(close - open)))
+    if array.size(a_dir) > 1000
+        array.shift(a_f1), array.shift(a_f2), array.shift(a_dir)
+
+float votes = 0.0
+if array.size(a_dir) > k
+    array<float> distances = array.new_float(0)
+    for i = 0 to array.size(a_dir) - 1
+        distances.push(math.sqrt(math.pow(f1 - a_f1.get(i), 2) + math.pow(f2 - a_f2.get(i), 2)))
+    int[] sorted_idx = array.sort_indices(distances, order.ascending)
+    for i = 0 to k - 1
+        votes += a_dir.get(sorted_idx.get(i))
+
+// --------------------------------------------------------------------------------
+// Filtros y Ejecución
+// --------------------------------------------------------------------------------
+float emaVal = ta.ema(close, i_emaLen)
+bool trend_long  = not i_useEma or close > emaVal
+bool trend_short = not i_useEma or close < emaVal
+bool vol_filter  = not i_filterVol or ta.atr(10) > ta.atr(40)
+
+bool buy_sig  = votes > 0 and trend_long and vol_filter
+bool sell_sig = votes < 0 and trend_short and vol_filter
+
+// --------------------------------------------------------------------------------
+// Trailing Stop Dinámico
+// --------------------------------------------------------------------------------
+float atr = ta.atr(i_atrLen)
+var float trailStop = na
+var int activeSignal = 0 
+
+if buy_sig and activeSignal != 1
+    activeSignal := 1
+    trailStop := low - (atr * i_atrMult)
+else if sell_sig and activeSignal != -1
+    activeSignal := -1
+    trailStop := high + (atr * i_atrMult)
+else if activeSignal == 1
+    trailStop := math.max(trailStop, low - (atr * i_atrMult))
+    if close < trailStop
+        activeSignal := 0
+        trailStop := na
+else if activeSignal == -1
+    trailStop := math.min(trailStop, high + (atr * i_atrMult))
+    if close > trailStop
+        activeSignal := 0
+        trailStop := na
+
+// --------------------------------------------------------------------------------
+// Panel Estadístico (Dashboard)
+// --------------------------------------------------------------------------------
+var int t_trades = 0, var int t_wins = 0
+bool trade_won = (activeSignal[1] == 1 and close > open) or (activeSignal[1] == -1 and close < open)
+
+if (buy_sig and activeSignal[1] != 1) or (sell_sig and activeSignal[1] != -1)
+    t_trades += 1
+    if trade_won[1]
+        t_wins += 1
+
+float winRate = t_trades > 0 ? (t_wins / t_trades) * 100 : 0
+
+var table stats = table.new(position.top_right, 2, 5, #1e222d, #363a45, 1, #363a45, 1)
+if barstate.islast
+    table.cell(stats, 0, 0, "ESTADÍSTICAS", text_color=color.white, bgcolor=#2962ff)
+    table.cell(stats, 1, 0, "VALOR",        text_color=color.white, bgcolor=#2962ff)
+    table.cell(stats, 0, 1, "Total Trades", text_color=color.gray)
+    table.cell(stats, 1, 1, str.tostring(t_trades), text_color=color.white)
+    table.cell(stats, 0, 2, "Win Rate",    text_color=color.gray)
+    table.cell(stats, 1, 2, str.tostring(winRate, "#.##") + "%", text_color=winRate > 50 ? color.green : color.red)
+    table.cell(stats, 0, 3, "Trend EMA",   text_color=color.gray)
+    table.cell(stats, 1, 3, str.tostring(i_emaLen), text_color=color.aqua)
+    table.cell(stats, 0, 4, "Votos kNN",   text_color=color.gray)
+    table.cell(stats, 1, 4, str.tostring(votes), text_color=votes > 0 ? color.green : color.red)
+
+// --------------------------------------------------------------------------------
+// Visuales Finales
+// --------------------------------------------------------------------------------
+plot(i_useEma ? emaVal : na, "EMA", color.new(#2962ff, 50), 2)
+plot(trailStop, "Trailing Stop", activeSignal == 1 ? color.new(color.green, 0) : activeSignal == -1 ? color.new(color.red, 0) : na, 2, plot.style_linebr)
+
+plotshape(buy_sig and activeSignal[1] != 1, "BUY", shape.labelup, location.belowbar, color.green, text='BUY', textcolor=color.white, size=size.small)
+plotshape(sell_sig and activeSignal[1] != -1, "SELL", shape.labeldown, location.abovebar, color.red, text='SELL', textcolor=color.white, size=size.small)
+
+// Alertas Push
+if (buy_sig and activeSignal[1] != 1) or (sell_sig and activeSignal[1] != -1)
+    alert("ML kNN: Nueva entrada en " + syminfo.ticker, alert.freq_once_per_bar_close)

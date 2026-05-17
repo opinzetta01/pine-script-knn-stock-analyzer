@@ -1,12 +1,12 @@
-# 🧠 ML kNN Stock Analyzer V2 [TradingView Pine Script v6]
+# 🧠 ML kNN Stock Analyzer V3 Pro [TradingView Pine Script v6]
 
-Este es un indicador de análisis técnico algorítmico avanzado para TradingView desarrollado en **Pine Script v6**. Utiliza un **modelo adaptativo de Machine Learning basado en K-Nearest Neighbors (kNN)** optimizado específicamente para el mercado de **acciones** (Stocks), aplicando ponderación por distancia inversa, métricas institucionales clave y un sistema dinámico de gestión de riesgo.
+Este es un indicador de análisis técnico algorítmico avanzado para TradingView desarrollado en **Pine Script v6**. Utiliza un **modelo adaptativo de Machine Learning basado en K-Nearest Neighbors (kNN)** optimizado específicamente para el mercado de **acciones** (Stocks), aplicando ponderación por distancia inversa, métricas institucionales clave y un avanzado **sistema dinámico de gestión de riesgo con telemetría de rendimiento real**.
 
-A diferencia de los clasificadores kNN genéricos diseñados para Forex o Criptomonedas, esta versión 2.0 integra un motor multidimensional con 6 variables simultáneas y filtros avanzados contra la manipulación institucional y el ruido de mercado.
+Esta versión **V3 Pro** es el resultado de fusionar la inteligencia analítica multidimensional del V2 (6 dimensiones) con un sistema de gestión de capital institucional (Trailing Stop basado en ATR) y evaluación estadística en tiempo real.
 
 ---
 
-## 🚀 Características Clave (v2.0)
+## 🚀 Características Clave (v3.0 Pro)
 
 1. **Feature Engineering Multidimensional (6D kNN)**: Analiza simultáneamente 6 variables críticas optimizadas para renta variable:
    * **Momentum Relativo**: RSI normalizado.
@@ -15,49 +15,58 @@ A diferencia de los clasificadores kNN genéricos diseñados para Forex o Cripto
    * **Gap de Apertura (%)**: Factoriza la volatilidad inicial del mercado accionario.
    * **Ancho de Bollinger Bands (Squeeze)**: Clasifica si el mercado está en compresión o expansión.
    * **Posición EMA 50**: Tendencia de mediano plazo basada en momentum.
-2. **K Dinámico y Adaptativo**: El número de vecinos analizados se ajusta en tiempo real según la volatilidad actual medida por ATR, buscando reacciones rápidas en tendencias expansivas y promedios estables en mercados laterales.
-3. **Votación Ponderada por Distancia Inversa**: Los patrones históricos más similares al actual tienen un mayor peso e influencia en la votación del modelo.
+
+2. **Gestión de Riesgo Integrada (Trailing Stop ATR Dinámico)**:
+   * Implementa un sistema de Stop Loss dinámico que sigue al precio basado en la volatilidad actual (múltiplo de ATR).
+   * El stop "persigue" el precio a favor de la tendencia (`math.max` para posiciones largas, `math.min` para cortas), protegiendo las ganancias a medida que la operación avanza.
+   * Permite definir y visualizar en el gráfico cuándo una operación se cierra definitivamente por tocar el Trailing Stop.
+
+3. **Telemetría Real de Performance (Win Rate Estadístico)**:
+   * El sistema rastrea métricas de operaciones cerradas reales (no simuladas).
+   * Calcula de manera precisa el total de operaciones (`Total Trades`) y el porcentaje de acierto (`Win Rate %`) únicamente cuando el precio cruza el trailing stop.
+   * Totalmente protegido contra "repintado": las evaluaciones se hacen en base a cierres de vela y estados históricos pasados sin mirar al futuro.
+
 4. **Filtros Institucionales de Calidad**:
-   * **EMA 200 (Tendencia Macro)**: Solo permite compras (Longs) arriba de la EMA 200 y ventas (Shorts) abajo.
    * **Filtro de Confianza**: Bloquea cualquier señal con un consenso de vecinos inferior al **55%**.
    * **Filtro de Volumen Institucional**: Evita operar barras con RVOL inferior a **0.8x** (ruido minorista).
-   * **Cooldown Temporal**: Bloquea la repetición consecutiva de señales para evitar el *overtrading* destructivo.
 
 ---
 
 ## 📊 Interpretación del Gráfico y las Señales
 
-El indicador se integra visualmente de manera limpia y ofrece tres capas de interpretación sobre el gráfico:
+El indicador se integra visualmente de manera limpia y ofrece múltiples capas de interpretación:
 
 ### 1. Señales de Compra y Venta (BUY / SELL)
 *   **Etiqueta Verde `BUY` (Debajo de la vela)**: Señal de Compra confirmada por el modelo y todos sus filtros.
 *   **Etiqueta Roja `SELL` (Arriba de la vela)**: Señal de Venta confirmada.
-*   **Gradiente de Confianza (Opacidad)**: El color de las etiquetas es translúcido si la confianza es baja (cercana al 55%), y sólido y brillante si la confianza se aproxima al 100%.
+*   **Gradiente de Confianza (Opacidad)**: El color de las etiquetas es translúcido si la confianza es baja, y sólido/brillante si la confianza es alta.
 
-### 2. Franjas de Fondo (Regímenes de Mercado)
-*   **Fondo Verde Suave**: Régimen Alcista Activo (Tendencia e impulso a favor de compras).
-*   **Fondo Rojo Suave**: Régimen Bajista Activo (Tendencia e impulso a favor de ventas).
+### 2. Trailing Stop Loss Dinámico
+*   **Línea Fucsia / Roja Punteada**: Se dibuja durante una posición activa de venta (Short), marcando el nivel límite del Stop Loss.
+*   **Línea Cyan / Verde Punteada**: Se dibuja durante una posición activa de compra (Long), mostrando cómo el Stop Loss sube acompañando el precio.
+*   El cruce del precio con esta línea indica el cierre (salida) de la posición.
+
+### 3. Franjas de Fondo (Regímenes de Mercado)
+*   **Fondo Verde Suave**: Régimen Alcista Activo.
+*   **Fondo Rojo Suave**: Régimen Bajista Activo.
 *   **Fondo Gris / Sin Color**: Mercado Neutral o de acumulación lateral. Todos los filtros están protegiendo la cuenta al bloquear operaciones.
-
-### 3. Medias Móviles de Referencia
-*   **Línea Naranja**: EMA 50 (Soporte/Resistencia dinámica de mediano plazo).
-*   **Línea Azul**: EMA 200 (Frontera institucional para definir el sesgo macro alcista o bajista).
 
 ---
 
-## 🧠 Telemetría del Dashboard (En Tiempo Real)
+## 🧠 Dashboard de Telemetría (En Tiempo Real)
 
-El indicador incluye una tabla de telemetría personalizable (disponible en tamaños: *Pequeño*, *Normal* y *Grande*) que muestra el estado de las variables procesadas en la vela actual:
+El indicador incluye una tabla de telemetría expandida y personalizable que muestra el estado de las variables y el rendimiento histórico de la estrategia:
 
-*   **Predicción**: Indica si la recomendación del modelo es `🟢 COMPRA`, `🔴 VENTA` o `⚪ NEUTRAL`.
+*   **Total Trades**: Cantidad total de operaciones completadas desde el inicio del historial del gráfico.
+*   **Win Rate real**: Porcentaje estadístico de precisión en las operaciones pasadas.
+*   **Predicción**: `🟢 COMPRA`, `🔴 VENTA` o `⚪ NEUTRAL`.
 *   **Confianza**: El porcentaje exacto de vecinos que votaron a favor de la dirección.
 *   **Régimen**: El sesgo de tendencia macro (`📈 ALCISTA` o `📉 BAJISTA`).
-*   **K Dinámico**: El número adaptativo actual de vecinos analizados.
-*   **Alcistas/Bajistas**: Desglose exacto de los votos (ej. `18 / 7`).
-*   **RVOL**: Multiplicador de volumen. Muestra iconos de estado (`🔥` volumen masivo, `✅` saludable, `⚠️` volumen minorista).
-*   **Dist. VWAP**: Distancia en ATRs del precio respecto al VWAP diario.
-*   **Volatilidad**: Estado del rango actual (`⚡ ALTA` para impulsos, `😴 BAJA` para fases de compresión pre-ruptura).
-*   **Datos Entren.**: Cantidad de barras históricas indexadas en la base de datos local en la memoria RAM del script.
+*   **K Dinámico**: Número adaptativo actual de vecinos analizados.
+*   **RVOL**: Multiplicador de volumen con iconos de estado (`🔥` masivo, `✅` saludable, `⚠️` minorista).
+*   **Dist. VWAP**: Distancia en ATRs del precio respecto al VWAP.
+*   **Volatilidad**: Estado del rango actual (`⚡ ALTA` para impulsos, `😴 BAJA` para fases de compresión).
+*   **Datos Entren.**: Cantidad de barras históricas indexadas en el motor del modelo.
 
 ---
 
@@ -66,13 +75,15 @@ El indicador incluye una tabla de telemetría personalizable (disponible en tama
 | Parámetro | Day Trading (Velocidad) | Swing Trading (Robustez) |
 |-----------|---------------------|----------------------|
 | **Velas (Timeframe)** | 5m, 15m, 1h | 1D, 1W |
-| **K Base** | 150 | 252 (Un año de datos diarios) |
+| **K Base** | 150 | 252 |
 | **Barras Etiquetado** | 1 - 2 | 3 - 5 |
 | **EMA Rápida** | 20 | 50 |
 | **EMA Lenta** | 50 | 200 |
-| **Cooldown Bars** | 3 vel. | 5 - 10 vel. |
+| **Multiplicador ATR** | 2.5 - 3.0 | 3.5 - 4.0 |
 | **RVOL Mínimo** | 1.0x | 0.8x |
 | **Umbral Confianza** | 60% | 55% |
+
+*Nota: Asegúrate de ajustar el **Multiplicador ATR** de la gestión de riesgo según la volatilidad específica del activo. Un valor de 2.5 suele ser estándar, pero acciones más volátiles pueden requerir valores mayores (3.0 o más).*
 
 ---
 
@@ -80,7 +91,7 @@ El indicador incluye una tabla de telemetría personalizable (disponible en tama
 
 1. Abre el gráfico de cualquier acción en [TradingView](https://www.tradingview.com/).
 2. Haz clic en la pestaña **Pine Editor** en la parte inferior de la pantalla.
-3. Borra el código existente y pega el contenido completo del archivo `ML kNN Stock Analyzer V2.pine`.
+3. Borra el código existente y pega el contenido completo del archivo `ML kNN Stock Analyzer V3 Pro.pine`.
 4. Haz clic en **Añadir al gráfico** (Add to chart).
 5. Configura los parámetros a tu gusto haciendo clic en el engranaje `⚙️` en el nombre del indicador.
 
