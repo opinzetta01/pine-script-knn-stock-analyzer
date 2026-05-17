@@ -1,0 +1,339 @@
+//@version=6
+indicator('ML kNN Stock Analyzer V2 [OSKY]', 'ML-kNN Stocks v2', true, max_labels_count=300, max_bars_back=5000)
+
+// ════════════════════════════════════════════════════════════════════════════════
+//                        CONFIGURACIÓN DE USUARIO
+// ════════════════════════════════════════════════════════════════════════════════
+
+// --- Parámetros del Modelo ---
+grp_model = "🧠 Modelo KNN"
+i_baseK       = input.int(252, 'Vecinos Base (K)', 5, tooltip="Base para calcular K dinámico. K final se adapta a la volatilidad actual.", group=grp_model)
+i_maxBars     = input.int(1500, 'Límite Histórico de Entrenamiento', 500, 5000, tooltip="Cantidad de barras almacenadas para el entrenamiento. Más barras = más contexto, pero más lento.", group=grp_model)
+i_labelBars   = input.int(3, 'Barras para Etiquetado', 1, 10, tooltip="Número de barras futuras para evaluar si un movimiento fue alcista o bajista.", group=grp_model)
+i_kMin        = input.int(5, 'K Mínimo', 3, 20, group=grp_model)
+i_kMax        = input.int(30, 'K Máximo', 15, 60, group=grp_model)
+
+// --- Parámetros de Features ---
+grp_feat = "📊 Features"
+i_rsiLen      = input.int(14, 'Periodo RSI', 5, 50, group=grp_feat)
+i_rvolLen     = input.int(20, 'Periodo Volumen Relativo', 10, 50, group=grp_feat)
+i_bbLen       = input.int(20, 'Periodo Bollinger Bands', 10, 50, group=grp_feat)
+i_emaFast     = input.int(50, 'EMA Rápida (Tendencia)', 20, 100, group=grp_feat)
+i_emaSlow     = input.int(200, 'EMA Lenta (Macro)', 100, 300, group=grp_feat)
+
+// --- Filtros de Señal ---
+grp_filt = "🔒 Filtros"
+i_useTrendFilter  = input.bool(true, 'Filtro Tendencia Macro (EMA lenta)', group=grp_filt, tooltip="Solo compras arriba de EMA lenta, solo ventas abajo.")
+i_useConfFilter   = input.bool(true, 'Filtro de Confianza', group=grp_filt)
+i_confThreshold   = input.int(55, 'Umbral de Confianza (%)', 20, 90, group=grp_filt, tooltip="Solo opera si la confianza del modelo supera este umbral.")
+i_cooldownBars    = input.int(5, 'Cooldown entre Señales (barras)', 1, 20, group=grp_filt, tooltip="Mínimo de barras entre señales consecutivas para evitar overtrading.")
+i_useVolFilter    = input.bool(true, 'Filtro Volatilidad Dinámica', group=grp_filt)
+i_useRvolFilter   = input.bool(true, 'Filtro Volumen Relativo Mínimo', group=grp_filt)
+i_rvolMin         = input.float(0.8, 'RVOL Mínimo para Operar', 0.3, 3.0, step=0.1, group=grp_filt, tooltip="Filtra señales en barras con volumen relativo bajo (sin interés institucional).")
+
+// --- Visualización ---
+grp_viz = "🎨 Visualización"
+i_showDashboard   = input.bool(true, 'Mostrar Dashboard', group=grp_viz)
+i_showBgColor     = input.bool(true, 'Colorear Fondo por Régimen', group=grp_viz)
+i_dashPos         = input.string('Top Right', 'Posición Dashboard', ['Top Right','Top Left','Bottom Right','Bottom Left'], group=grp_viz)
+i_dashSize        = input.string('Grande', 'Tamaño del Dashboard', ['Pequeño', 'Normal', 'Grande'], group=grp_viz)
+
+// ════════════════════════════════════════════════════════════════════════════════
+//                    FEATURE ENGINEERING PARA ACCIONES
+// ════════════════════════════════════════════════════════════════════════════════
+
+// Función para normalizar datos (Min-Max Scaler) con protección anti-NaN
+minimax(float x, int p) =>
+    float hi = ta.highest(x, p)
+    float lo = ta.lowest(x, p)
+    float range_val = hi - lo
+    range_val > 0 ? (x - lo) / range_val : 0.5
+
+// --- Feature 1: Momentum (RSI Normalizado) ---
+float raw_rsi     = ta.rsi(close, i_rsiLen)
+float f_momentum  = minimax(raw_rsi, i_rsiLen * 3)
+
+// --- Feature 2: Volumen Relativo (RVOL) ---
+float vol_sma     = ta.sma(volume, i_rvolLen)
+float raw_rvol    = vol_sma > 0 ? volume / vol_sma : 1.0
+float f_relvol    = minimax(raw_rvol, i_rvolLen * 2)
+
+// --- Feature 3: Distancia a VWAP (en unidades de ATR) ---
+float current_atr = ta.atr(14)
+float vwap_val    = ta.vwap(hlc3)
+float raw_vwap_d  = current_atr > 0 ? (close - vwap_val) / current_atr : 0.0
+float f_vwap_dist = minimax(raw_vwap_d, 50)
+
+// --- Feature 4: Gap de Apertura (%) ---
+float raw_gap     = close[1] != 0 ? (open - close[1]) / close[1] * 100 : 0.0
+float f_gap       = minimax(raw_gap, 50)
+
+// --- Feature 5: Ancho de Bollinger Bands (Squeeze/Expansión) ---
+float bb_middle   = ta.sma(close, i_bbLen)
+float bb_std      = ta.stdev(close, i_bbLen)
+float bb_upper    = bb_middle + 2 * bb_std
+float bb_lower    = bb_middle - 2 * bb_std
+float raw_bbw     = bb_middle > 0 ? (bb_upper - bb_lower) / bb_middle : 0.0
+float f_bbw       = minimax(raw_bbw, i_bbLen * 3)
+
+// --- Feature 6: Posición Relativa a EMA50 (en ATR) ---
+float ema_fast    = ta.ema(close, i_emaFast)
+float raw_trend   = current_atr > 0 ? (close - ema_fast) / current_atr : 0.0
+float f_trend     = minimax(raw_trend, i_emaFast)
+
+// ════════════════════════════════════════════════════════════════════════════════
+//          ETIQUETADO INTELIGENTE (Multi-Barra, SIN Repainting)
+// ════════════════════════════════════════════════════════════════════════════════
+// Miramos el cambio de precio de i_labelBars barras ATRÁS para clasificar
+// Esto evita look-ahead bias: solo usamos datos ya cerrados
+float price_change = close[i_labelBars] != 0 ? (close[1] - close[1 + i_labelBars]) / close[1 + i_labelBars] : 0.0
+int class_label    = price_change > 0 ? 1 : -1
+
+// ════════════════════════════════════════════════════════════════════════════════
+//           K DINÁMICO (Adaptativo por Régimen de Volatilidad)
+// ════════════════════════════════════════════════════════════════════════════════
+float atr_short      = ta.atr(10)
+float atr_long       = ta.atr(40)
+float vol_ratio      = atr_long > 0 ? atr_short / atr_long : 1.0
+
+// En alta volatilidad (vol_ratio > 1): K baja → reacciona rápido
+// En baja volatilidad (vol_ratio < 1): K sube → filtra ruido
+int k_base           = math.floor(math.sqrt(i_baseK))
+float k_adjusted     = k_base / math.max(vol_ratio, 0.3)
+int k                = math.max(i_kMin, math.min(i_kMax, int(math.round(k_adjusted))))
+
+// ════════════════════════════════════════════════════════════════════════════════
+//                  GESTIÓN DE MEMORIA (6 Features en Arrays)
+// ════════════════════════════════════════════════════════════════════════════════
+var array<float> a_f1 = array.new_float(0) // Momentum
+var array<float> a_f2 = array.new_float(0) // RVOL
+var array<float> a_f3 = array.new_float(0) // VWAP Distance
+var array<float> a_f4 = array.new_float(0) // Gap
+var array<float> a_f5 = array.new_float(0) // BBW
+var array<float> a_f6 = array.new_float(0) // Trend Position
+var array<int>   a_dir = array.new_int(0)  // Labels
+
+// Mantener solo los últimos N registros para eficiencia
+if array.size(a_dir) > i_maxBars
+    array.shift(a_f1)
+    array.shift(a_f2)
+    array.shift(a_f3)
+    array.shift(a_f4)
+    array.shift(a_f5)
+    array.shift(a_f6)
+    array.shift(a_dir)
+
+// Entrenar solo con datos cerrados (evitar look-ahead bias)
+// Usamos [1 + i_labelBars] para alinear features con su etiqueta correcta
+int lb = 1 + i_labelBars
+if bar_index > lb
+    array.push(a_f1, nz(f_momentum[lb]))
+    array.push(a_f2, nz(f_relvol[lb]))
+    array.push(a_f3, nz(f_vwap_dist[lb]))
+    array.push(a_f4, nz(f_gap[lb]))
+    array.push(a_f5, nz(f_bbw[lb]))
+    array.push(a_f6, nz(f_trend[lb]))
+    array.push(a_dir, class_label)
+
+// ════════════════════════════════════════════════════════════════════════════════
+//          ALGORITMO kNN CON VOTACIÓN PONDERADA POR DISTANCIA
+// ════════════════════════════════════════════════════════════════════════════════
+float prediction     = 0.0
+float confidence     = 0.0
+int   bulls          = 0
+int   bears          = 0
+float avg_dist       = 0.0
+
+if bar_index > lb + i_rsiLen and array.size(a_dir) > k
+    array<float> distances = array.new_float(0)
+    
+    // Calcular Distancia Euclidiana 6D
+    int data_size = array.size(a_dir)
+    for i = 0 to data_size - 1
+        float d1 = f_momentum  - array.get(a_f1, i)
+        float d2 = f_relvol    - array.get(a_f2, i)
+        float d3 = f_vwap_dist - array.get(a_f3, i)
+        float d4 = f_gap       - array.get(a_f4, i)
+        float d5 = f_bbw       - array.get(a_f5, i)
+        float d6 = f_trend     - array.get(a_f6, i)
+        float d  = math.sqrt(d1*d1 + d2*d2 + d3*d3 + d4*d4 + d5*d5 + d6*d6)
+        array.push(distances, d)
+    
+    // Encontrar los k vecinos más cercanos (sort_indices v6)
+    int[] sorted_indices = array.sort_indices(distances, order.ascending)
+    
+    // Votación ponderada por distancia inversa
+    float weighted_sum  = 0.0
+    float weight_total  = 0.0
+    float dist_sum      = 0.0
+    int actual_k        = math.min(k, array.size(sorted_indices))
+    
+    for i = 0 to actual_k - 1
+        int   idx    = array.get(sorted_indices, i)
+        float dist   = array.get(distances, idx)
+        float weight = 1.0 / (dist + 1e-9) // Inverso de la distancia
+        int   label  = array.get(a_dir, idx)
+        
+        weighted_sum += label * weight
+        weight_total += weight
+        dist_sum     += dist
+        
+        if label > 0
+            bulls += 1
+        else
+            bears += 1
+    
+    prediction := weight_total > 0 ? weighted_sum / weight_total : 0.0
+    avg_dist   := actual_k > 0 ? dist_sum / actual_k : 0.0
+    
+    // Score de Confianza (0-100)
+    // Basado en: qué tan unánimes son los vecinos
+    float majority   = math.max(bulls, bears)
+    confidence       := actual_k > 0 ? (majority / actual_k) * 100 : 0.0
+
+// ════════════════════════════════════════════════════════════════════════════════
+//                    FILTROS DE CALIDAD DE SEÑAL
+// ════════════════════════════════════════════════════════════════════════════════
+
+// Filtro 1: Tendencia Macro (EMA Lenta)
+float ema_slow       = ta.ema(close, i_emaSlow)
+bool trend_bull      = close > ema_slow
+bool trend_bear      = close < ema_slow
+bool trend_ok_long   = i_useTrendFilter ? trend_bull : true
+bool trend_ok_short  = i_useTrendFilter ? trend_bear : true
+
+// Filtro 2: Confianza mínima
+bool conf_ok         = i_useConfFilter ? confidence >= i_confThreshold : true
+
+// Filtro 3: Volatilidad dinámica (ATR corto > ATR largo = mercado activo)
+bool vol_ok          = i_useVolFilter ? atr_short > atr_long * 0.7 : true
+
+// Filtro 4: Volumen Relativo mínimo
+bool rvol_ok         = i_useRvolFilter ? raw_rvol >= i_rvolMin : true
+
+// Filtro 5: Cooldown (anti-overtrading)
+var int bars_since_signal = 0
+bars_since_signal += 1
+
+// --- Condiciones Finales ---
+bool raw_long  = prediction > 0 and trend_ok_long and conf_ok and vol_ok and rvol_ok
+bool raw_short = prediction < 0 and trend_ok_short and conf_ok and vol_ok and rvol_ok
+
+bool long_cond  = raw_long  and not raw_long[1]  and bars_since_signal >= i_cooldownBars
+bool short_cond = raw_short and not raw_short[1] and bars_since_signal >= i_cooldownBars
+
+// Reset cooldown cuando se genera una señal
+if long_cond or short_cond
+    bars_since_signal := 0
+
+// ════════════════════════════════════════════════════════════════════════════════
+//                         VISUALIZACIÓN
+// ════════════════════════════════════════════════════════════════════════════════
+
+// --- Colores Dinámicos con Gradiente de Confianza ---
+color bull_c = color.from_gradient(confidence, 40, 100, color.new(#00C853, 60), color.new(#00C853, 0))
+color bear_c = color.from_gradient(confidence, 40, 100, color.new(#FF1744, 60), color.new(#FF1744, 0))
+
+// --- Señales en el Gráfico ---
+plotshape(long_cond,  'Compra', shape.labelup,   location.belowbar, bull_c, text='BUY',  textcolor=color.white, size=size.small)
+plotshape(short_cond, 'Venta',  shape.labeldown,  location.abovebar,  bear_c, text='SELL', textcolor=color.white, size=size.small)
+
+// --- EMAs de referencia ---
+plot(ema_fast, 'EMA Rápida', color.new(#FFA726, 50), 1)
+plot(ema_slow, 'EMA Lenta',  color.new(#42A5F5, 50), 1)
+
+// --- Colores de Fondo por Régimen ---
+color bg_color = na
+if i_showBgColor
+    if prediction > 0 and trend_bull
+        bg_color := color.new(#00C853, 93)
+    else if prediction < 0 and trend_bear
+        bg_color := color.new(#FF1744, 93)
+bgcolor(bg_color, title="Fondo por Régimen")
+
+// ════════════════════════════════════════════════════════════════════════════════
+//                         DASHBOARD INFORMATIVO
+// ════════════════════════════════════════════════════════════════════════════════
+// Posición de la tabla (calculado globalmente)
+var table_pos = switch i_dashPos
+    'Top Right'    => position.top_right
+    'Top Left'     => position.top_left
+    'Bottom Right' => position.bottom_right
+    => position.bottom_left
+
+var table dash = table.new(table_pos, 2, 10, 
+     bgcolor=color.new(#1E1E2E, 5), border_color=color.new(#444444, 20), border_width=1,
+     frame_color=color.new(#555555, 10), frame_width=2)
+
+if i_showDashboard and barstate.islast
+    // Resolver tamaños de texto dinámicos para la tabla
+    string size_title = switch i_dashSize
+        'Pequeño' => size.small
+        'Normal'  => size.normal
+        => size.large
+
+    string size_label = switch i_dashSize
+        'Pequeño' => size.tiny
+        'Normal'  => size.small
+        => size.normal
+
+    string size_value = switch i_dashSize
+        'Pequeño' => size.small
+        'Normal'  => size.normal
+        => size.large
+
+    // Header
+    table.cell(dash, 0, 0, '🧠 ML kNN Stocks', text_color=color.white, text_size=size_title, bgcolor=color.new(#6C5CE7, 10))
+    table.cell(dash, 1, 0, 'v2.0', text_color=color.gray, text_size=size_label, bgcolor=color.new(#6C5CE7, 10))
+    
+    // Predicción
+    string pred_txt = prediction > 0 ? '🟢 COMPRA' : prediction < 0 ? '🔴 VENTA' : '⚪ NEUTRAL'
+    color pred_clr  = prediction > 0 ? color.lime : prediction < 0 ? color.red : color.gray
+    table.cell(dash, 0, 1, 'Predicción', text_color=color.gray, text_size=size_label)
+    table.cell(dash, 1, 1, pred_txt, text_color=pred_clr, text_size=size_value)
+    
+    // Confianza
+    string conf_icon = confidence >= 80 ? '🟢' : confidence >= 55 ? '🟡' : '🔴'
+    table.cell(dash, 0, 2, 'Confianza', text_color=color.gray, text_size=size_label)
+    table.cell(dash, 1, 2, conf_icon + ' ' + str.tostring(confidence, '#') + '%', text_color=color.white, text_size=size_value)
+    
+    // Régimen
+    string regime_txt = trend_bull ? '📈 ALCISTA' : '📉 BAJISTA'
+    color regime_clr  = trend_bull ? color.lime : color.red
+    table.cell(dash, 0, 3, 'Régimen', text_color=color.gray, text_size=size_label)
+    table.cell(dash, 1, 3, regime_txt, text_color=regime_clr, text_size=size_value)
+    
+    // K actual
+    table.cell(dash, 0, 4, 'K Dinámico', text_color=color.gray, text_size=size_label)
+    table.cell(dash, 1, 4, str.tostring(k), text_color=color.white, text_size=size_value)
+    
+    // Vecinos
+    table.cell(dash, 0, 5, 'Alcistas/Bajistas', text_color=color.gray, text_size=size_label)
+    table.cell(dash, 1, 5, str.tostring(bulls) + ' / ' + str.tostring(bears), text_color=color.white, text_size=size_value)
+    
+    // RVOL
+    string rvol_icon = raw_rvol >= 2.0 ? '🔥' : raw_rvol >= 1.0 ? '✅' : '⚠️'
+    table.cell(dash, 0, 6, 'RVOL', text_color=color.gray, text_size=size_label)
+    table.cell(dash, 1, 6, rvol_icon + ' ' + str.tostring(raw_rvol, '#.##') + 'x', text_color=color.white, text_size=size_value)
+    
+    // Distancia VWAP
+    table.cell(dash, 0, 7, 'Dist. VWAP', text_color=color.gray, text_size=size_label)
+    table.cell(dash, 1, 7, str.tostring(raw_vwap_d, '#.##') + ' ATR', text_color= raw_vwap_d > 0 ? color.lime : color.red, text_size=size_value)
+    
+    // Vol Ratio
+    string vol_txt = vol_ratio > 1.2 ? '⚡ ALTA' : vol_ratio > 0.8 ? '➡️ NORMAL' : '😴 BAJA'
+    table.cell(dash, 0, 8, 'Volatilidad', text_color=color.gray, text_size=size_label)
+    table.cell(dash, 1, 8, vol_txt, text_color=color.white, text_size=size_value)
+    
+    // Training size
+    table.cell(dash, 0, 9, 'Datos Entren.', text_color=color.gray, text_size=size_label)
+    table.cell(dash, 1, 9, str.tostring(array.size(a_dir)) + ' barras', text_color=color.gray, text_size=size_label)
+
+// ════════════════════════════════════════════════════════════════════════════════
+//                              ALERTAS
+// ════════════════════════════════════════════════════════════════════════════════
+if long_cond
+    alert("🟢 BUY | Confianza: " + str.tostring(confidence, '#') + "% | RVOL: " + str.tostring(raw_rvol, '#.#') + "x | K=" + str.tostring(k), alert.freq_once_per_bar_close)
+
+if short_cond
+    alert("🔴 SELL | Confianza: " + str.tostring(confidence, '#') + "% | RVOL: " + str.tostring(raw_rvol, '#.#') + "x | K=" + str.tostring(k), alert.freq_once_per_bar_close)
