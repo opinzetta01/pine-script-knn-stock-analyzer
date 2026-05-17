@@ -1,0 +1,342 @@
+//@version=6
+indicator("Spline Quantile Regression Channel V2 [Osky_AI]", "Spline QRC V2", overlay = true, max_polylines_count = 10, max_labels_count = 6)
+
+//══════════════════════════════════════════════════════════════════════════════
+// Settings
+//══════════════════════════════════════════════════════════════════════════════
+// ── Spline Configuration ──
+int   nInput        = input.int(100, "Lookback Period", minval = 10, group = "Spline Configuration", tooltip = "Number of bars for regression fit.")
+int   knotsInput    = input.int(3, "Internal Knots", minval = 1, maxval = 15, group = "Spline Configuration", tooltip = "More knots = more flexible curve.")
+srcInput            = input.source(close, "Price Source", group = "Spline Configuration", tooltip = "Select close, hlc3, ohlc4, hl2, etc.")
+bool  useAdaptKnots = input.bool(false, "Adaptive Knots (Volatility)", group = "Spline Configuration", tooltip = "Concentrate knots in high-volatility zones.")
+bool  useRobustStd  = input.bool(true, "Robust Standardization (MAD)", group = "Spline Configuration", tooltip = "Median/MAD instead of Mean/Stdev. Resists outliers.")
+
+// ── Optimization ──
+int   maxIters      = input.int(100, "Max IRLS Iterations", minval = 1, maxval = 200, group = "Optimization", tooltip = "Early stopping may terminate sooner.")
+float convEps       = input.float(1e-6, "Convergence Epsilon", minval = 1e-8, maxval = 1e-2, step = 1e-6, group = "Optimization", tooltip = "Threshold for beta convergence in IRLS.")
+int   extLen        = input.int(20, "Forecast Length", minval = 0, maxval = 100, group = "Optimization", tooltip = "Bars projected into the future.")
+float decayFactor   = input.float(0.97, "Forecast Decay", minval = 0.80, maxval = 1.0, step = 0.01, group = "Optimization", tooltip = "Exponential decay applied to forecast slope. 1.0 = pure linear.")
+
+// ── Quantile Levels ──
+float upperQ        = input.float(0.95, "Upper Quantile", minval = 0.01, maxval = 0.99, step = 0.05, group = "Quantile Levels")
+float midQ          = input.float(0.50, "Median Quantile", minval = 0.01, maxval = 0.99, step = 0.05, group = "Quantile Levels")
+float lowerQ        = input.float(0.05, "Lower Quantile", minval = 0.01, maxval = 0.99, step = 0.05, group = "Quantile Levels")
+
+// ── Visuals ──
+color upperCol      = input.color(#f23645, "Upper Color", group = "Visuals")
+color midCol        = input.color(#ff9800, "Median Color", group = "Visuals")
+color lowerCol      = input.color(#089981, "Lower Color", group = "Visuals")
+int   lineW         = input.int(2, "Line Width", minval = 1, group = "Visuals")
+bool  showDash      = input.bool(true, "Show Dashboard", group = "Visuals")
+bool  showSignals   = input.bool(true, "Show Signals", group = "Visuals")
+
+//══════════════════════════════════════════════════════════════════════════════
+// Knot Generation
+//══════════════════════════════════════════════════════════════════════════════
+
+// Uniform knots in [0, 1]
+get_uniform_knots(int k_count) =>
+    array<float> knots = array.new<float>(0)
+    for i = 1 to k_count
+        knots.push(float(i) / (k_count + 1))
+    knots
+
+// Adaptive knots: concentrate where price changed most
+get_adaptive_knots(array<float> y_raw, int k_count) =>
+    int n = y_raw.size()
+    array<float> cum = array.new<float>(n, 0.0)
+    for i = 1 to n - 1
+        cum.set(i, cum.get(i - 1) + math.abs(y_raw.get(i) - y_raw.get(i - 1)))
+    float total = cum.get(n - 1)
+    array<float> knots = array.new<float>(0)
+    if total > 0
+        for j = 1 to k_count
+            float target = total * float(j) / (k_count + 1)
+            bool found = false
+            for i = 1 to n - 1
+                if cum.get(i) >= target and not found
+                    float frac = (target - cum.get(i - 1)) / math.max(cum.get(i) - cum.get(i - 1), 1e-10)
+                    float x_pos = (float(i - 1) + frac) / math.max(1.0, float(n - 1))
+                    knots.push(math.min(math.max(x_pos, 0.02), 0.98))
+                    found := true
+    // Fallback to uniform if not enough knots found
+    for j = knots.size() + 1 to k_count
+        knots.push(float(j) / (k_count + 1))
+    knots
+
+//══════════════════════════════════════════════════════════════════════════════
+// Design Matrix (cubic spline basis, history only)
+//══════════════════════════════════════════════════════════════════════════════
+get_design_matrix(int n, array<float> knots) =>
+    int k_count = knots.size()
+    int cols = 4 + k_count
+    matrix<float> X = matrix.new<float>(n, cols)
+    for i = 0 to n - 1
+        float x = float(i) / math.max(1, n - 1)
+        X.set(i, 0, 1.0)
+        X.set(i, 1, x)
+        X.set(i, 2, math.pow(x, 2))
+        X.set(i, 3, math.pow(x, 3))
+        for j = 0 to k_count - 1
+            X.set(i, 4 + j, math.pow(math.max(0, x - knots.get(j)), 3))
+    X
+
+//══════════════════════════════════════════════════════════════════════════════
+// IRLS Quantile Regression Solver (with early stopping + shared init)
+//══════════════════════════════════════════════════════════════════════════════
+solve_qr(matrix<float> X_train, array<float> y, float tau, int max_it, float eps, array<float> beta_init) =>
+    int n = X_train.rows()
+    int p = X_train.columns()
+    array<float> beta = beta_init.copy()
+    int iters_used = 0
+
+    for iter = 1 to max_it
+        iters_used := iter
+        array<float> y_pred = X_train.mult(beta)
+        matrix<float> XtWX = matrix.new<float>(p, p, 0.0)
+        array<float> XtWy = array.new<float>(p, 0.0)
+
+        for i = 0 to n - 1
+            float res = y.get(i) - y_pred.get(i)
+            float w = (res > 0 ? tau : (1.0 - tau)) / math.max(math.abs(res), 1e-6)
+            for j = 0 to p - 1
+                float xw = X_train.get(i, j) * w
+                XtWy.set(j, XtWy.get(j) + xw * y.get(i))
+                for k = 0 to p - 1
+                    XtWX.set(j, k, XtWX.get(j, k) + xw * X_train.get(i, k))
+
+        for j = 0 to p - 1
+            XtWX.set(j, j, XtWX.get(j, j) + 1e-4)
+
+        matrix<float> inv = XtWX.inv()
+        if not na(inv)
+            array<float> beta_new = inv.mult(XtWy)
+            // ── Early stopping: check convergence ──
+            float delta = 0.0
+            for j = 0 to p - 1
+                delta += math.pow(beta_new.get(j) - beta.get(j), 2)
+            beta := beta_new
+            if math.sqrt(delta) < eps
+                break
+        else
+            break
+
+    [beta, iters_used]
+
+//══════════════════════════════════════════════════════════════════════════════
+// Pinball Loss (quantile loss metric)
+//══════════════════════════════════════════════════════════════════════════════
+calc_pinball_loss(array<float> y, array<float> fitted, float tau) =>
+    float total = 0.0
+    int n = y.size()
+    for i = 0 to n - 1
+        float res = y.get(i) - fitted.get(i)
+        total += (res >= 0 ? tau * res : (tau - 1.0) * res)
+    total / n
+
+//══════════════════════════════════════════════════════════════════════════════
+// Rendering: historical polyline + forecast with linear decay
+//══════════════════════════════════════════════════════════════════════════════
+var polyline upHist = na, var polyline upExt = na
+var polyline midHist = na, var polyline midExt = na
+var polyline loHist = na, var polyline loExt = na
+
+render_band(array<float> fitted_vals, int n, int ext, float decay, color c, int width, polyline old_hist, polyline old_ext) =>
+    array<chart.point> hist_pts = array.new<chart.point>()
+    array<chart.point> ext_pts  = array.new<chart.point>()
+
+    // Historical fitted curve
+    for i = 0 to n - 1
+        hist_pts.push(chart.point.from_index(bar_index - (n - 1 - i), fitted_vals.get(i)))
+
+    // Forecast: linear extrapolation from last 2 points with decay
+    float val_last = fitted_vals.get(n - 1)
+    float val_prev = fitted_vals.get(n - 2)
+    float slope = val_last - val_prev
+
+    ext_pts.push(chart.point.from_index(bar_index, val_last))   // bridge point
+    for i = 1 to ext
+        float d = math.pow(decay, i)
+        float val = val_last + slope * i * d
+        ext_pts.push(chart.point.from_index(bar_index + i, val))
+
+    polyline.delete(old_hist)
+    polyline.delete(old_ext)
+    new_hist = polyline.new(hist_pts, line_color = c, line_width = width)
+    new_ext  = polyline.new(ext_pts, line_color = c, line_width = width, line_style = line.style_dashed)
+    [new_hist, new_ext]
+
+//══════════════════════════════════════════════════════════════════════════════
+// Main Execution
+//══════════════════════════════════════════════════════════════════════════════
+float global_atr = ta.atr(14)
+
+if barstate.islast and bar_index >= nInput
+    // ── 1. Data Preparation ──
+    array<float> y_raw = array.new<float>(nInput)
+    for i = 0 to nInput - 1
+        y_raw.set(nInput - 1 - i, srcInput[i])
+
+    // ── 2. Standardization (robust or classic) ──
+    float mu_y = 0.0
+    float sigma_y = 0.0
+    if useRobustStd
+        mu_y := y_raw.median()
+        array<float> abs_dev = array.new<float>(nInput)
+        for i = 0 to nInput - 1
+            abs_dev.set(i, math.abs(y_raw.get(i) - mu_y))
+        sigma_y := math.max(abs_dev.median() * 1.4826, 1e-6)
+    else
+        mu_y := y_raw.avg()
+        sigma_y := math.max(y_raw.stdev(), 1e-6)
+
+    array<float> y_std = array.new<float>(nInput)
+    for i = 0 to nInput - 1
+        y_std.set(i, (y_raw.get(i) - mu_y) / sigma_y)
+
+    // ── 3. Knot Selection ──
+    array<float> knots = useAdaptKnots ? get_adaptive_knots(y_raw, knotsInput) : get_uniform_knots(knotsInput)
+
+    // ── 4. Design Matrix (history only — forecast is linear decay) ──
+    matrix<float> X_train = get_design_matrix(nInput, knots)
+
+    // ── 5. Pre-compute shared Ridge OLS initial estimate (ONCE for all 3 quantiles) ──
+    matrix<float> Xt = X_train.transpose()
+    matrix<float> XtX = matrix.mult(Xt, X_train)
+    int p = XtX.columns()
+    for i = 0 to p - 1
+        XtX.set(i, i, XtX.get(i, i) + 1e-4)
+    matrix<float> XtX_inv = XtX.inv()
+    array<float> beta_init = na
+    if not na(XtX_inv)
+        beta_init := matrix.mult(matrix.mult(XtX_inv, Xt), y_std)
+    else
+        beta_init := array.new<float>(p, 0.0)
+        beta_init.set(0, y_std.avg())
+
+    // ── 6. Solve Quantile Regressions (with shared init + early stopping) ──
+    [b_up, it_up]   = solve_qr(X_train, y_std, upperQ, maxIters, convEps, beta_init)
+    [b_mid, it_mid] = solve_qr(X_train, y_std, midQ, maxIters, convEps, beta_init)
+    [b_lo, it_lo]   = solve_qr(X_train, y_std, lowerQ, maxIters, convEps, beta_init)
+
+    // ── 7. Compute Fitted Values (de-standardized) ──
+    array<float> fit_up_std  = X_train.mult(b_up)
+    array<float> fit_mid_std = X_train.mult(b_mid)
+    array<float> fit_lo_std  = X_train.mult(b_lo)
+
+    array<float> fit_up  = array.new<float>(nInput)
+    array<float> fit_mid = array.new<float>(nInput)
+    array<float> fit_lo  = array.new<float>(nInput)
+    for i = 0 to nInput - 1
+        fit_up.set(i, fit_up_std.get(i) * sigma_y + mu_y)
+        fit_mid.set(i, fit_mid_std.get(i) * sigma_y + mu_y)
+        fit_lo.set(i, fit_lo_std.get(i) * sigma_y + mu_y)
+
+    // ── 8. Render Bands ──
+    [h_up, e_up]   = render_band(fit_up, nInput, extLen, decayFactor, upperCol, lineW, upHist, upExt)
+    upHist := h_up
+    upExt := e_up
+
+    [h_mid, e_mid] = render_band(fit_mid, nInput, extLen, decayFactor, midCol, lineW, midHist, midExt)
+    midHist := h_mid
+    midExt := e_mid
+
+    [h_lo, e_lo]   = render_band(fit_lo, nInput, extLen, decayFactor, lowerCol, lineW, loHist, loExt)
+    loHist := h_lo
+    loExt := e_lo
+
+    // ── 9. Quality Metrics ──
+    float pl_up  = calc_pinball_loss(y_std, fit_up_std, upperQ)
+    float pl_mid = calc_pinball_loss(y_std, fit_mid_std, midQ)
+    float pl_lo  = calc_pinball_loss(y_std, fit_lo_std, lowerQ)
+
+    // Coverage: % of bars inside the channel
+    int inside = 0
+    float ch_width_sum = 0.0
+    for i = 0 to nInput - 1
+        if y_raw.get(i) >= fit_lo.get(i) and y_raw.get(i) <= fit_up.get(i)
+            inside += 1
+        ch_width_sum += (fit_up.get(i) - fit_lo.get(i))
+    float coverage = float(inside) / nInput * 100.0
+    float avg_width = ch_width_sum / nInput
+    float width_atr_ratio = avg_width / math.max(global_atr, 1e-6)
+
+    // Forecast direction
+    float slope_mid = fit_mid.get(nInput - 1) - fit_mid.get(nInput - 2)
+    string fcst_dir = slope_mid > 0 ? "▲ BULLISH" : slope_mid < 0 ? "▼ BEARISH" : "◆ NEUTRAL"
+
+    // ── 10. Signals ──
+    if showSignals
+        float last_close = srcInput
+        float last_up  = fit_up.get(nInput - 1)
+        float last_lo  = fit_lo.get(nInput - 1)
+        float last_mid = fit_mid.get(nInput - 1)
+        float ch_w = last_up - last_lo
+
+        if last_close > last_up
+            label.new(bar_index, last_close, "⚠ ABOVE UPPER", style = label.style_label_down, color = color.new(upperCol, 30), textcolor = color.white, size = size.normal)
+            alert("Price ABOVE upper quantile band (" + str.tostring(upperQ, "#.##") + ")", alert.freq_once_per_bar_close)
+        else if last_close < last_lo
+            label.new(bar_index, last_close, "⚠ BELOW LOWER", style = label.style_label_up, color = color.new(lowerCol, 30), textcolor = color.white, size = size.normal)
+            alert("Price BELOW lower quantile band (" + str.tostring(lowerQ, "#.##") + ")", alert.freq_once_per_bar_close)
+        else if math.abs(last_close - last_mid) < ch_w * 0.1
+            label.new(bar_index, last_close, "◈ AT MEDIAN", style = label.style_label_left, color = color.new(midCol, 50), textcolor = color.white, size = size.small)
+
+        // Squeeze detection
+        if width_atr_ratio < 1.5
+            label.new(bar_index, last_lo, "🔸 SQUEEZE", style = label.style_label_up, color = color.new(#ffeb3b, 30), textcolor = color.black, size = size.small)
+            alert("Channel SQUEEZE detected — potential breakout", alert.freq_once_per_bar_close)
+
+    // ── 11. Telemetry Dashboard ──
+    if showDash
+        var table dash = table.new(position.top_right, 3, 9, bgcolor = color.new(#1e222d, 10), border_color = color.new(#363a45, 0), border_width = 1, frame_color = color.new(#363a45, 0), frame_width = 1)
+
+        // Header
+        table.cell(dash, 0, 0, "METRIC", text_color = color.gray, text_size = size.normal, text_halign = text.align_left)
+        table.cell(dash, 1, 0, "VALUE", text_color = color.gray, text_size = size.normal, text_halign = text.align_right)
+        table.cell(dash, 2, 0, "STATUS", text_color = color.gray, text_size = size.normal, text_halign = text.align_center)
+
+        // IRLS Iterations
+        table.cell(dash, 0, 1, "IRLS Iters (Up/Mid/Lo)", text_color = color.white, text_size = size.normal, text_halign = text.align_left)
+        table.cell(dash, 1, 1, str.tostring(it_up) + " / " + str.tostring(it_mid) + " / " + str.tostring(it_lo), text_color = #2196f3, text_size = size.normal, text_halign = text.align_right)
+        int max_it_used = math.max(it_up, math.max(it_mid, it_lo))
+        table.cell(dash, 2, 1, max_it_used < maxIters ? "✓ Converged" : "⚠ Max Hit", text_color = max_it_used < maxIters ? #089981 : #f23645, text_size = size.normal, text_halign = text.align_center)
+
+        // Pinball Loss
+        table.cell(dash, 0, 2, "Pinball Loss (Up)", text_color = color.white, text_size = size.normal, text_halign = text.align_left)
+        table.cell(dash, 1, 2, str.tostring(pl_up, "#.####"), text_color = upperCol, text_size = size.normal, text_halign = text.align_right)
+        table.cell(dash, 2, 2, pl_up < 0.1 ? "✓ Good" : "△ Check", text_color = pl_up < 0.1 ? #089981 : #ff9800, text_size = size.normal, text_halign = text.align_center)
+
+        table.cell(dash, 0, 3, "Pinball Loss (Mid)", text_color = color.white, text_size = size.normal, text_halign = text.align_left)
+        table.cell(dash, 1, 3, str.tostring(pl_mid, "#.####"), text_color = midCol, text_size = size.normal, text_halign = text.align_right)
+        table.cell(dash, 2, 3, pl_mid < 0.1 ? "✓ Good" : "△ Check", text_color = pl_mid < 0.1 ? #089981 : #ff9800, text_size = size.normal, text_halign = text.align_center)
+
+        table.cell(dash, 0, 4, "Pinball Loss (Lo)", text_color = color.white, text_size = size.normal, text_halign = text.align_left)
+        table.cell(dash, 1, 4, str.tostring(pl_lo, "#.####"), text_color = lowerCol, text_size = size.normal, text_halign = text.align_right)
+        table.cell(dash, 2, 4, pl_lo < 0.1 ? "✓ Good" : "△ Check", text_color = pl_lo < 0.1 ? #089981 : #ff9800, text_size = size.normal, text_halign = text.align_center)
+
+        // Coverage
+        table.cell(dash, 0, 5, "Channel Coverage", text_color = color.white, text_size = size.normal, text_halign = text.align_left)
+        table.cell(dash, 1, 5, str.tostring(coverage, "#.#") + "%", text_color = #2196f3, text_size = size.normal, text_halign = text.align_right)
+        float expected_cov = (upperQ - lowerQ) * 100
+        table.cell(dash, 2, 5, math.abs(coverage - expected_cov) < 10 ? "✓ Calibrated" : "△ Off", text_color = math.abs(coverage - expected_cov) < 10 ? #089981 : #ff9800, text_size = size.normal, text_halign = text.align_center)
+
+        // Channel Width / ATR
+        table.cell(dash, 0, 6, "Width / ATR", text_color = color.white, text_size = size.normal, text_halign = text.align_left)
+        table.cell(dash, 1, 6, str.tostring(width_atr_ratio, "#.##") + "x", text_color = width_atr_ratio < 2.0 ? #ffeb3b : #2196f3, text_size = size.normal, text_halign = text.align_right)
+        table.cell(dash, 2, 6, width_atr_ratio < 1.5 ? "🔸 Squeeze" : width_atr_ratio > 4.0 ? "⚡ Wide" : "◆ Normal", text_color = width_atr_ratio < 1.5 ? #ffeb3b : width_atr_ratio > 4.0 ? #f23645 : #089981, text_size = size.normal, text_halign = text.align_center)
+
+        // Forecast Direction
+        table.cell(dash, 0, 7, "Forecast", text_color = color.white, text_size = size.normal, text_halign = text.align_left)
+        table.cell(dash, 1, 7, fcst_dir, text_color = slope_mid > 0 ? #089981 : slope_mid < 0 ? #f23645 : #ff9800, text_size = size.normal, text_halign = text.align_right)
+        table.cell(dash, 2, 7, useAdaptKnots ? "Adaptive" : "Uniform", text_color = color.gray, text_size = size.normal, text_halign = text.align_center)
+
+        // Standardization method
+        table.cell(dash, 0, 8, "Standardization", text_color = color.white, text_size = size.normal, text_halign = text.align_left)
+        table.cell(dash, 1, 8, useRobustStd ? "MAD (Robust)" : "Stdev (Classic)", text_color = color.gray, text_size = size.normal, text_halign = text.align_right)
+        table.cell(dash, 2, 8, "", text_color = color.gray, text_size = size.normal, text_halign = text.align_center)
+
+    // ── 12. Logging ──
+    log.info("Spline QRC V2 computed — Iters: " + str.tostring(it_up) + "/" + str.tostring(it_mid) + "/" + str.tostring(it_lo) + " | Coverage: " + str.tostring(coverage, "#.#") + "% | Forecast: " + fcst_dir)
+
+//══════════════════════════════════════════════════════════════════════════════
